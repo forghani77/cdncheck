@@ -2,6 +2,7 @@ package generate
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,9 +10,9 @@ import (
 	"net/http"
 	"net/netip"
 	"regexp"
+	"strings"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/ipinfo/go/v2/ipinfo"
 	"github.com/projectdiscovery/cdncheck"
 	stringsutil "github.com/projectdiscovery/utils/strings"
 )
@@ -100,41 +101,57 @@ func (c *Category) fetchInputItem(options *Options, data map[string][]string) er
 			}
 		}
 	}
-	// Only scrape ASN if we have an ID
-	if !options.HasAuthInfo() {
-		return nil
-	}
-	for provider, asn := range c.ASN {
-		for _, item := range asn {
-			if cidrs, err := getIpInfoASN(http.DefaultClient, options.IPInfoToken, item); err != nil {
-				return fmt.Errorf("could not get asn %s: %s", item, err)
-			} else {
-				data[provider] = cidrs
+		for provider, asn := range c.ASN {
+			for _, item := range asn {
+				if cidrs, err := GetIpInfoASN(http.DefaultClient, options.IPInfoToken, item); err != nil {
+					log.Printf("[err] could not get asn %s: %s\n", item, err)
+				} else {
+					data[provider] = append(data[provider], cidrs...)
+				}
+			}
+			// Deduplicate and validate CIDRs
+			if len(data[provider]) > 0 {
+				data[provider] = getValidateCidrs(data[provider])
 			}
 		}
-	}
 	return nil
 }
 
 var errNoCidrFound = errors.New("no cidrs found for url")
 
-// getIpInfoASN returns cidrs for an ASN from ipinfo using a token
-func getIpInfoASN(httpClient *http.Client, token string, asn string) ([]string, error) {
-	if token == "" {
-		return nil, errors.New("ipinfo auth token not specified")
-	}
-	ipinfoClient := ipinfo.NewClient(httpClient, nil, token)
-	info, err := ipinfoClient.GetASNDetails(asn)
+// getIpInfoASN returns cidrs for an ASN from ipverse (no token required)
+func GetIpInfoASN(httpClient *http.Client, token string, asn string) ([]string, error) {
+	// Trim "AS" prefix if present
+	asnNumber := strings.TrimPrefix(strings.ToUpper(asn), "AS")
+	url := fmt.Sprintf("https://raw.githubusercontent.com/ipverse/as-ip-blocks/master/as/%s/aggregated.json", asnNumber)
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	if info == nil {
-		return nil, errNoCidrFound
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
 	}
-	var cidrs []string
-	for _, prefix := range info.Prefixes {
-		cidrs = append(cidrs, prefix.Netblock)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("could not get asn %s: %s", asn, resp.Status)
 	}
+
+	var data struct {
+		Prefixes struct {
+			IPv4 []string `json:"ipv4"`
+			IPv6 []string `json:"ipv6"`
+		} `json:"prefixes"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	cidrs := append(data.Prefixes.IPv4, data.Prefixes.IPv6...)
 	if len(cidrs) == 0 {
 		return nil, errNoCidrFound
 	}
